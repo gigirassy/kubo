@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-#### Builder: build static-ish binary (alpine builder)
+#### Builder: Blop check!
 FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.25-alpine AS builder
 
 ARG TARGETOS TARGETARCH
