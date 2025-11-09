@@ -1,98 +1,99 @@
 # syntax=docker/dockerfile:1
-# Enables BuildKit with cache mounts for faster builds
-FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.25 AS builder
+
+#### Builder: build static-ish binary (alpine builder)
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.25-alpine AS builder
 
 ARG TARGETOS TARGETARCH
+ARG MAKE_TARGET=build
+ARG IPFS_PLUGINS
 
 ENV SRC_DIR=/kubo
 
-# Cache go module downloads between builds for faster rebuilds
 COPY go.mod go.sum $SRC_DIR/
 WORKDIR $SRC_DIR
-RUN --mount=type=cache,target=/go/pkg/mod \
-  go mod download
+RUN apk add make bash --no-cache
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . $SRC_DIR
 
-# Preload an in-tree but disabled-by-default plugin by adding it to the IPFS_PLUGINS variable
-# e.g. docker build --build-arg IPFS_PLUGINS="foo bar baz"
-ARG IPFS_PLUGINS
-
-# Allow for other targets to be built, e.g.: docker build --build-arg MAKE_TARGET="nofuse"
-ARG MAKE_TARGET=build
-
-# Build ipfs binary with cached go modules and build cache.
-# mkdir .git/objects allows git rev-parse to read commit hash for version info
+# Attempt static-ish build: CGO disabled, trimmed paths, stripped symbols
 RUN --mount=type=cache,target=/go/pkg/mod \
-  --mount=type=cache,target=/root/.cache/go-build \
-  mkdir -p .git/objects \
-  && GOOS=$TARGETOS GOARCH=$TARGETARCH GOFLAGS=-buildvcs=false make ${MAKE_TARGET} IPFS_PLUGINS=$IPFS_PLUGINS
+    --mount=type=cache,target=/root/.cache/go-build \
+    mkdir -p .git/objects \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+       GOFLAGS='-trimpath' \
+       make ${MAKE_TARGET} IPFS_PLUGINS="$IPFS_PLUGINS" LDFLAGS='-s -w'
 
-# Extract required runtime tools from Debian.
-# We use Debian instead of Alpine because we need glibc compatibility
-# for the busybox base image we're using.
-FROM debian:bookworm-slim AS utilities
-RUN set -eux; \
-	apt-get update; \
-	apt-get install -y --no-install-recommends \
-		tini \
-    # Using gosu (~2MB) instead of su-exec (~20KB) because it's easier to
-    # install on Debian. Useful links:
-    # - https://github.com/ncopa/su-exec#why-reinvent-gosu
-    # - https://github.com/tianon/gosu/issues/52#issuecomment-441946745
-		gosu \
-    # fusermount enables IPFS mount commands
-    fuse \
-    ca-certificates \
-	; \
-	apt-get clean; \
-	rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Collect runtime artifacts in /out so final stages can COPY from a single place
+RUN mkdir -p /out/usr/local/bin \
+ && cp -a $SRC_DIR/cmd/ipfs/ipfs /out/usr/local/bin/ipfs 2>/dev/null || true \
+ && cp -a $SRC_DIR/bin/container_daemon /out/usr/local/bin/start_ipfs 2>/dev/null || true \
+ && cp -a $SRC_DIR/bin/container_init_run /out/usr/local/bin/container_init_run 2>/dev/null || true \
+ && chmod 755 /out/usr/local/bin/* || true
 
-# Final minimal image with shell for debugging (busybox provides sh)
-FROM busybox:stable-glibc
-
-# Copy ipfs binary, startup scripts, and runtime dependencies
-ENV SRC_DIR=/kubo
-COPY --from=utilities /usr/sbin/gosu /sbin/gosu
-COPY --from=utilities /usr/bin/tini /sbin/tini
-COPY --from=utilities /bin/fusermount /usr/local/bin/fusermount
-COPY --from=utilities /etc/ssl/certs /etc/ssl/certs
-COPY --from=builder $SRC_DIR/cmd/ipfs/ipfs /usr/local/bin/ipfs
-COPY --from=builder --chmod=755 $SRC_DIR/bin/container_daemon /usr/local/bin/start_ipfs
-COPY --from=builder $SRC_DIR/bin/container_init_run /usr/local/bin/container_init_run
-
-# Set SUID for fusermount to enable FUSE mounting by non-root user
-RUN chmod 4755 /usr/local/bin/fusermount
-
-# Swarm P2P port (TCP/UDP) - expose publicly for peer connections
-EXPOSE 4001 4001/udp
-# API port - keep private, only for trusted clients
-EXPOSE 5001
-# Gateway port - can be exposed publicly via reverse proxy
-EXPOSE 8080
-# Swarm WebSockets - expose publicly for browser-based peers
-EXPOSE 8081
-
-# Create ipfs user (uid 1000) and required directories with proper ownership
+#### Final: Alpine runtime (no FUSE)
+FROM alpine:latest AS final
 ENV IPFS_PATH=/data/ipfs
-RUN mkdir -p $IPFS_PATH /ipfs /ipns /mfs /container-init.d \
-  && adduser -D -h $IPFS_PATH -u 1000 -G users ipfs \
-  && chown ipfs:users $IPFS_PATH /ipfs /ipns /mfs /container-init.d
-
-# Volume for IPFS repository data persistence
-VOLUME $IPFS_PATH
-
-# The default logging level
 ENV GOLOG_LOG_LEVEL=""
 
-# Entrypoint initializes IPFS repo if needed and configures networking.
-# tini ensures proper signal handling and zombie process cleanup
+# Install runtime packages directly in final stage (more robust than copying from utilities)
+RUN apk add --no-cache tini su-exec ca-certificates
+
+# Provide a lightweight 'gosu' compatibility symlink if any scripts expect /sbin/gosu
+RUN ln -sf /sbin/su-exec /sbin/gosu
+
+# Copy built binaries & scripts from builder
+COPY --from=builder /out/usr/local/bin/ipfs /usr/local/bin/ipfs
+COPY --from=builder /out/usr/local/bin/start_ipfs /usr/local/bin/start_ipfs
+COPY --from=builder /out/usr/local/bin/container_init_run /usr/local/bin/container_init_run
+
+RUN chmod 755 /usr/local/bin/ipfs /usr/local/bin/start_ipfs /usr/local/bin/container_init_run
+
+# user, dirs, permissions
+RUN addgroup -g 1000 ipfs \
+ && adduser -D -u 1000 -G ipfs ipfs \
+ && mkdir -p $IPFS_PATH /ipfs /ipns /mfs /container-init.d \
+ && chown ipfs:ipfs $IPFS_PATH /ipfs /ipns /mfs /container-init.d
+
+VOLUME $IPFS_PATH
+EXPOSE 4001 4001/udp 5001 8080 8081
+
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/start_ipfs"]
 
-# Health check verifies IPFS daemon is responsive.
-# Uses empty directory CID (QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn) as test
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD ipfs --api=/ip4/127.0.0.1/tcp/5001 dag stat /ipfs/QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn || exit 1
 
-# Default: run IPFS daemon with auto-migration enabled
+CMD ["daemon", "--migrate=true", "--agent-version-suffix=docker"]
+
+#### Final with FUSE: installs fuse and sets SUID on fusermount if present
+FROM alpine:latest AS final-fuse
+ENV IPFS_PATH=/data/ipfs
+ENV GOLOG_LOG_LEVEL=""
+
+RUN apk add --no-cache tini su-exec ca-certificates fuse
+
+RUN ln -sf /sbin/su-exec /sbin/gosu
+
+COPY --from=builder /out/usr/local/bin/ipfs /usr/local/bin/ipfs
+COPY --from=builder /out/usr/local/bin/start_ipfs /usr/local/bin/start_ipfs
+COPY --from=builder /out/usr/local/bin/container_init_run /usr/local/bin/container_init_run
+
+RUN chmod 755 /usr/local/bin/ipfs /usr/local/bin/start_ipfs /usr/local/bin/container_init_run || true
+
+# set SUID for fusermount if it's installed in common locations
+RUN if [ -e /usr/bin/fusermount ]; then chmod 4755 /usr/bin/fusermount; \
+    elif [ -e /bin/fusermount ]; then chmod 4755 /bin/fusermount; fi || true
+
+RUN addgroup -g 1000 ipfs \
+ && adduser -D -u 1000 -G ipfs ipfs \
+ && mkdir -p $IPFS_PATH /ipfs /ipns /mfs /container-init.d \
+ && chown ipfs:ipfs $IPFS_PATH /ipfs /ipns /mfs /container-init.d
+
+VOLUME $IPFS_PATH
+EXPOSE 4001 4001/udp 5001 8080 8081
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/start_ipfs"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD ipfs --api=/ip4/127.0.0.1/tcp/5001 dag stat /ipfs/QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn || exit 1
+
 CMD ["daemon", "--migrate=true", "--agent-version-suffix=docker"]
