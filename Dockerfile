@@ -36,8 +36,8 @@ FROM alpine:latest AS final
 ENV IPFS_PATH=/data/ipfs
 ENV GOLOG_LOG_LEVEL=""
 
-# Install runtime packages directly in final stage (more robust than copying from utilities)
-RUN apk add --no-cache tini su-exec ca-certificates
+# Install runtime packages and jemalloc
+RUN apk add --no-cache tini su-exec ca-certificates jemalloc
 
 # Provide a lightweight 'gosu' compatibility symlink if any scripts expect /sbin/gosu
 RUN ln -sf /sbin/su-exec /sbin/gosu
@@ -55,6 +55,9 @@ RUN addgroup -g 1000 ipfs \
  && mkdir -p $IPFS_PATH /ipfs /ipns /mfs /container-init.d \
  && chown ipfs:ipfs $IPFS_PATH /ipfs /ipns /mfs /container-init.d
 
+# Make jemalloc the default allocator
+ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
+
 VOLUME $IPFS_PATH
 EXPOSE 4001 4001/udp 5001 8080 8081
 
@@ -65,13 +68,12 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 CMD ["daemon", "--migrate=true", "--agent-version-suffix=docker"]
 
-#### Final with FUSE: installs fuse and sets SUID on fusermount if present
+#### Final with FUSE
 FROM alpine:latest AS final-fuse
 ENV IPFS_PATH=/data/ipfs
 ENV GOLOG_LOG_LEVEL=""
 
-RUN apk add --no-cache tini su-exec ca-certificates fuse
-
+RUN apk add --no-cache tini su-exec ca-certificates fuse jemalloc
 RUN ln -sf /sbin/su-exec /sbin/gosu
 
 COPY --from=builder /out/usr/local/bin/ipfs /usr/local/bin/ipfs
@@ -88,6 +90,8 @@ RUN addgroup -g 1000 ipfs \
  && adduser -D -u 1000 -G ipfs ipfs \
  && mkdir -p $IPFS_PATH /ipfs /ipns /mfs /container-init.d \
  && chown ipfs:ipfs $IPFS_PATH /ipfs /ipns /mfs /container-init.d
+
+ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 
 VOLUME $IPFS_PATH
 EXPOSE 4001 4001/udp 5001 8080 8081
